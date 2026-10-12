@@ -224,4 +224,6 @@ const styles = StyleSheet.create({
   emptyDesc: { fontSize: 14, color: C.textSub, textAlign: "center", lineHeight: 22, marginBottom: 24 },
   analyzeBtn: { marginHorizontal: 16, backgroundColor: C.primary, borderRadius: 14, paddingVertical: 14, alignItems: "center" },
   analyzeBtnText: { fontSize: 16, fontWeight: "700", color: C.white },
+  
 });
+
