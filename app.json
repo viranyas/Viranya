@@ -1,0 +1,17 @@
+{
+  "expo": {
+    "name": "PlanWise",
+    "slug": "planwise-app",
+    "version": "1.0.0",
+    "scheme": "planwise",
+    "platforms": ["ios", "android","web"],
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#4C1D95"
+      }
+    },
+    "plugins": [
+      "expo-router"
+    ]
+  }
+}
