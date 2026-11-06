@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, KeyboardAvoidingView, Platform, ScrollView, StatusBar } from 'react-native';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
-import { register, logout } from '../../src/services';
+import { register, logout, setRegistrationInProgress } from '../../src/services';
 import { C } from '../../src/config/theme';
 
 export default function RegisterScreen() {
@@ -22,6 +22,10 @@ export default function RegisterScreen() {
     if (!username.trim()||!email.trim()||!password.trim()) { Alert.alert('แจ้งเตือน','กรุณากรอกชื่อ, อีเมล และรหัสผ่าน'); return; }
     if (password.length<6) { Alert.alert('แจ้งเตือน','รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร'); return; }
     setLoading(true);
+    // ตั้ง flag ก่อนเรียก register() กัน app/_layout.jsx ไม่ให้อ่านโปรไฟล์ตอน auto sign-in ชั่วครู่
+    // (ดูคอมเมนต์เหตุผลเต็ม ๆ ที่ setRegistrationInProgress ใน src/services/index.ts) แล้วค่อยปิด flag
+    // ใน finally หลัง logout() เสร็จแน่ ๆ แล้วเท่านั้น
+    setRegistrationInProgress(true);
     try {
       await register(username.trim(), email.trim(), password, goal.trim());
       await logout();
@@ -30,7 +34,7 @@ export default function RegisterScreen() {
       ]);
     }
     catch (e) { Alert.alert('สมัครไม่สำเร็จ', e.code==='auth/email-already-in-use'?'อีเมลนี้ถูกใช้แล้ว':'เกิดข้อผิดพลาด'); }
-    finally { setLoading(false); }
+    finally { setRegistrationInProgress(false); setLoading(false); }
   };
 
   return (

@@ -55,16 +55,23 @@ export default function TodosScreen() {
   // ดึงรายการงานทั้งหมดของ user จาก Firestore ผ่าน getTodos (src/services) แล้วจัดเรียงใหม่
   const load = async () => {
     if (!user) return;
-    const raw = await getTodos(user.uid);
-    // เรียง: งานที่เสร็จแล้วอยู่ล่างสุด -> งานค้างเรียงตาม Priority -> ตามด้วยวันเวลา
-    const sorted = [...raw].sort((a, b) => {
-      if (a.status !== b.status) return a.status === "done" ? 1 : -1;
-      const pd = PRI_ORDER[a.priority] - PRI_ORDER[b.priority];
-      if (pd !== 0) return pd;
-      if (a.dueDatetime && b.dueDatetime) return a.dueDatetime.getTime() - b.dueDatetime.getTime();
-      return a.dueDatetime ? -1 : 1;
-    });
-    setTodos(sorted);
+    try {
+      const raw = await getTodos(user.uid);
+      // เรียง: งานที่เสร็จแล้วอยู่ล่างสุด -> งานค้างเรียงตาม Priority -> ตามด้วยวันเวลา
+      // งานที่เสร็จแล้วเรียงจากกดทำล่าสุดขึ้นก่อน (ใช้ updatedAt ที่ handleToggle อัปเดตตอนติ๊กเสร็จ)
+      const sorted = [...raw].sort((a, b) => {
+        if (a.status !== b.status) return a.status === "done" ? 1 : -1;
+        if (a.status === "done") return b.updatedAt.getTime() - a.updatedAt.getTime();
+        const pd = PRI_ORDER[a.priority] - PRI_ORDER[b.priority];
+        if (pd !== 0) return pd;
+        if (a.dueDatetime && b.dueDatetime) return a.dueDatetime.getTime() - b.dueDatetime.getTime();
+        return a.dueDatetime ? -1 : 1;
+      });
+      setTodos(sorted);
+    } catch (e) {
+      // เกิดได้เมื่อกด logout ระหว่าง load() ยังทำงานค้างอยู่ — ไม่ใช่ error ที่ต้องแจ้งผู้ใช้
+      // (ดูคอมเมนต์เหตุผลเต็ม ๆ ที่ load() ใน app/(tabs)/home.jsx)
+    }
   };
 
   useEffect(() => { load(); }, [user]);

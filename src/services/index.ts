@@ -12,7 +12,7 @@ import {
   serverTimestamp, Timestamp,
 } from 'firebase/firestore';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { subDays, isAfter, format, subMonths } from 'date-fns';
+import { subDays, subWeeks, isAfter, format, subMonths, startOfWeek } from 'date-fns';
 import { auth, db } from '../config/firebase';
 import { HABIT_CATEGORIES, TODO_CATEGORIES, CATEGORY_META } from '../config/categories';
 import type {
@@ -27,13 +27,16 @@ const genAI = new GoogleGenerativeAI(
   process.env.EXPO_PUBLIC_GEMINI_API_KEY ?? '',
 );
 
-// ลำดับโมเดลที่จะลองเรียก — มีแค่ตัวเดียวที่ยืนยันแล้วว่ามีจริงสำหรับโปรเจกต์นี้ (gemini-2.5-flash / gemini-1.5-flash
-// ตอบ 404 "not found" แปลว่าไม่รองรับ API version นี้ ไม่ใช่โมเดลสำรองที่ใช้ได้จริง เลยเอาออก กันเจอ error ซ้ำซ้อน)
+// ลำดับโมเดลที่จะลองเรียก — มีแค่ตัวเดียวที่ยืนยันแล้วว่ามีจริงสำหรับโปรเจกต์นี้ (เช็คจาก AI Studio แล้ว)
+// gemini-2.5-flash / gemini-1.5-flash ตอบ 404 "not found" แปลว่าไม่รองรับ API version/project นี้
+// ไม่ใช่โมเดลสำรองที่ใช้ได้จริง เลยเอาออก กันเจอ error ซ้ำซ้อน (retry 2 รอบเปล่าๆ ก่อนตกไปใช้ fallback insights)
 // ถ้าจะเพิ่มโมเดลสำรองในอนาคต ต้องเช็คชื่อที่ถูกต้องจาก AI Studio ของโปรเจกต์นี้ก่อน ไม่เดาเอง
 const GEMINI_MODEL_CHAIN = ['gemini-3.6-flash'];
 
 // เช็คว่า error ที่เจอเป็นปัญหา "server โหลดสูงชั่วคราว" (503/overloaded) หรือเปล่า
 // แยกจาก error ประเภทอื่น (เช่น API key ผิด, prompt ผิดรูปแบบ) ที่ retry ซ้ำไปก็ไม่มีประโยชน์
+// รับ: err ที่ catch มาได้ (ไม่รู้ type แน่ชัด) -> คืนค่า: true/false
+// ใช้ต่อใน: generateWithFallback ด้านล่างเท่านั้น เพื่อตัดสินใจว่าจะ retry โมเดลเดิมซ้ำ หรือข้ามไปโมเดลถัดไปเลย
 function isOverloadedError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return msg.includes('503') || /overloaded|high demand/i.test(msg);
@@ -67,6 +70,17 @@ async function generateWithFallback(promptText: string): Promise<string> {
 // ═══════════════════════════════════════════
 // AUTH SERVICE
 // ═══════════════════════════════════════════
+
+// flag ชั่วคราวบอก app/_layout.jsx ว่ากำลังอยู่ในขั้นตอนสมัครสมาชิก (register() ตามด้วย logout() ติดกันทันที)
+// เหตุผล: createUserWithEmailAndPassword ใน register() จะ auto sign-in ให้เองชั่วครู่ ทำให้ onAuthChanged
+// ใน _layout.jsx ตื่นมาเรียก getUserProfile ทันที แล้วถ้า logout() ที่ตามมาดันยิง signOut ไปก่อน
+// getUserProfile จะอ่านเสร็จ -> Firestore จะปฏิเสธ request ที่ค้างอยู่ด้วย permission error (เห็นเป็น
+// "Uncaught (in promise) FirebaseError: Missing or insufficient permissions" ใน console)
+// ตั้ง flag นี้เป็น true คร่อมทั้ง register()+logout() กัน onAuthChanged ไม่ให้ยิง getUserProfile ตั้งแต่แรก
+// เรียกคู่กับ setRegistrationInProgress ใน app/(auth)/register.jsx
+let registrationInProgress = false;
+export function setRegistrationInProgress(v: boolean) { registrationInProgress = v; }
+export function isRegistrationInProgress(): boolean { return registrationInProgress; }
 
 // สมัครสมาชิกใหม่: สร้าง user ใน Firebase Auth แล้วสร้างเอกสารโปรไฟล์คู่กันที่ users/{uid}
 // เรียกจาก app/(auth)/register.jsx — หลังจบ onAuthChanged ใน app/_layout.jsx จะดึงโปรไฟล์นี้เข้า useStore.user ต่อเอง
@@ -290,27 +304,73 @@ export async function getHabits(uid: string): Promise<Habit[]> {
   const habits = snap.docs.map(d => toHabit(d.id, d.data() as Record<string, unknown>));
   // ค่าที่เก็บไว้จะค้างถ้าขาดวันโดยไม่ได้กดอะไร จึงคำนวณจาก log จริงทุกครั้งที่โหลด
   return Promise.all(habits.map(async h => {
-    const streakCount = await computeStreak(uid, h.id);
+    const streakCount = await computeStreak(uid, h.id, h.frequency);
     return { ...h, streakCount, bestStreak: Math.max(h.bestStreak ?? 0, streakCount) };
   }));
 }
 
-// ติ๊ก/ยกเลิกติ๊กว่าทำนิสัยนี้ "วันนี้" แล้ว — เขียน/ลบเอกสาร log ที่ users/{uid}/habits/{habitId}/logs/{yyyy-MM-dd}
-// แล้ว recalculate streak ให้ใหม่ทันที — เรียกจาก habits.jsx (handleToggle)
-export async function toggleHabitLog(uid: string, habitId: string, completed: boolean) {
-  const today = format(new Date(), 'yyyy-MM-dd');
-  const logRef = doc(db, 'users', uid, 'habits', habitId, 'logs', today);
-  if (completed) {
-    await setDoc(logRef, { completed: true, loggedAt: serverTimestamp() });
-  } else {
-    await deleteDoc(logRef);
-  }
-  await recalculateStreak(uid, habitId);
+// รายวันที่ของสัปดาห์ (จันทร์-อาทิตย์) ที่ครอบคลุม date — ใช้เช็ค/ค้นหา log ของนิสัยแบบ "ทุกสัปดาห์"
+// ที่ถือว่า "ทำแล้ว" ตราบใดที่มีวันใดวันหนึ่งในสัปดาห์ถูกติ๊ก ไม่จำเป็นต้องเป็นวันนี้เป๊ะๆ
+function weekDates(date: Date): string[] {
+  const start = startOfWeek(date, { weekStartsOn: 1 });
+  return Array.from({ length: 7 }, (_, i) =>
+    format(new Date(start.getFullYear(), start.getMonth(), start.getDate() + i), 'yyyy-MM-dd'),
+  );
 }
 
-// นับจำนวนวันที่กดทำติดกันจริง ถ้าวันไหนขาดก็หยุดนับ (เริ่มใหม่)
-// วันนี้ยังไม่ทำ = ยังไม่ขาด: นับต่อจากเมื่อวานได้ แต่ถ้าเมื่อวานก็ไม่ได้ทำ streak = 0
-export async function computeStreak(uid: string, habitId: string): Promise<number> {
+// เช็คว่ามี log ที่ completed=true อยู่ในชุดวันที่ที่ระบุหรือไม่ (ใช้เช็ค "ทำแล้วหรือยังในสัปดาห์นี้")
+async function isAnyDateCompleted(uid: string, habitId: string, dates: string[]): Promise<boolean> {
+  for (const date of dates) {
+    const snap = await getDoc(doc(db, 'users', uid, 'habits', habitId, 'logs', date));
+    if (snap.exists() && snap.data()?.completed) return true;
+  }
+  return false;
+}
+
+// ติ๊ก/ยกเลิกติ๊กว่าทำนิสัยนี้แล้ว — เขียน/ลบเอกสาร log ที่ users/{uid}/habits/{habitId}/logs/{yyyy-MM-dd}
+// แล้ว recalculate streak ให้ใหม่ทันที — เรียกจาก habits.jsx (handleToggle)
+// นิสัยแบบ "ทุกวัน" เขียน/ลบ log ของวันนี้ตรงๆ แต่ "ทุกสัปดาห์" ตอนยกเลิกต้องหา log ที่ติ๊กไว้ในสัปดาห์นี้มาลบ
+// (อาจไม่ใช่วันนี้ ถ้าผู้ใช้กดทำไปตั้งแต่ต้นสัปดาห์) ส่วนตอนติ๊กทำก็เขียนลงวันนี้เหมือนเดิม
+export async function toggleHabitLog(
+  uid: string, habitId: string, completed: boolean,
+  frequency: HabitFrequency = 'daily',
+) {
+  const today = format(new Date(), 'yyyy-MM-dd');
+  if (frequency === 'weekly' && !completed) {
+    for (const date of weekDates(new Date())) {
+      const ref = doc(db, 'users', uid, 'habits', habitId, 'logs', date);
+      const snap = await getDoc(ref);
+      if (snap.exists() && snap.data()?.completed) { await deleteDoc(ref); break; }
+    }
+  } else {
+    const logRef = doc(db, 'users', uid, 'habits', habitId, 'logs', today);
+    if (completed) {
+      await setDoc(logRef, { completed: true, loggedAt: serverTimestamp() });
+    } else {
+      await deleteDoc(logRef);
+    }
+  }
+  await recalculateStreak(uid, habitId, frequency);
+}
+
+// นับจำนวนช่วงเวลาที่ทำติดกันจริงตามความถี่ของนิสัย ถ้าช่วงไหนขาดก็หยุดนับ (เริ่มใหม่)
+// ทุกวัน: นับวันติดกัน (ช่วงปัจจุบัน=วันนี้ยังไม่ทำก็ยังไม่ขาด นับต่อจากเมื่อวานได้)
+// ทุกสัปดาห์: นับสัปดาห์ติดกัน (ช่วงปัจจุบัน=สัปดาห์นี้ยังไม่ทำก็ยังไม่ขาด นับต่อจากสัปดาห์ก่อนได้)
+// รับ: uid ของ user + habitId ของนิสัยที่จะเช็ค + frequency -> คืนค่า: จำนวนช่วงต่อเนื่อง (number)
+// ใช้ต่อใน: getHabits ด้านบน (คำนวณ streakCount สดใหม่ทุกครั้งที่โหลดลิสต์นิสัย) และ recalculateStreak ด้านล่าง
+export async function computeStreak(
+  uid: string, habitId: string, frequency: HabitFrequency = 'daily',
+): Promise<number> {
+  if (frequency === 'weekly') {
+    const isDoneWeek = (weeksAgo: number) =>
+      isAnyDateCompleted(uid, habitId, weekDates(subWeeks(new Date(), weeksAgo)));
+    let streak = (await isDoneWeek(0)) ? 1 : 0;
+    for (let i = 1; i < 104; i++) { // ย้อนหลังได้ถึง ~2 ปี
+      if (await isDoneWeek(i)) streak++; else break;
+    }
+    return streak;
+  }
+
   const isDone = async (daysAgo: number) => {
     const date = format(subDays(new Date(), daysAgo), 'yyyy-MM-dd');
     const snap = await getDoc(doc(db, 'users', uid, 'habits', habitId, 'logs', date));
@@ -324,8 +384,8 @@ export async function computeStreak(uid: string, habitId: string): Promise<numbe
 }
 
 // เขียน streakCount/bestStreak ที่คำนวณใหม่กลับลง users/{uid}/habits/{habitId} — เรียกจาก toggleHabitLog ด้านบนเท่านั้น
-export async function recalculateStreak(uid: string, habitId: string) {
-  const streak = await computeStreak(uid, habitId);
+export async function recalculateStreak(uid: string, habitId: string, frequency: HabitFrequency = 'daily') {
+  const streak = await computeStreak(uid, habitId, frequency);
   const hSnap = await getDoc(doc(db, 'users', uid, 'habits', habitId));
   const best  = (hSnap.data()?.bestStreak as number) ?? 0;
   await updateDoc(doc(db, 'users', uid, 'habits', habitId), {
@@ -333,9 +393,12 @@ export async function recalculateStreak(uid: string, habitId: string) {
   });
 }
 
-// เช็คสถานะของ "วันนี้" อย่างเดียว (ไม่ต้องดึงทั้งช่วง) ใช้กับหน้าที่แค่ต้องรู้ว่าวันนี้ทำแล้วหรือยัง
-// เรียกจาก home.jsx (load) เพื่อโชว์เครื่องหมายติ๊กในลิสต์นิสัยย่อหน้าแรก
-export async function isHabitDoneToday(uid: string, habitId: string): Promise<boolean> {
+// เช็คว่านิสัยนี้ "ทำแล้ว" ตามความถี่จริงของนิสัย — ทุกวัน=ต้องทำวันนี้, ทุกสัปดาห์=ทำวันไหนก็ได้ในสัปดาห์นี้
+// เรียกจาก home.jsx (load) เพื่อโชว์เครื่องหมายติ๊กในลิสต์นิสัยย่อหน้าแรก และจาก checkAndNotify ด้านล่าง
+export async function isHabitDoneToday(
+  uid: string, habitId: string, frequency: HabitFrequency = 'daily',
+): Promise<boolean> {
+  if (frequency === 'weekly') return isAnyDateCompleted(uid, habitId, weekDates(new Date()));
   const today = format(new Date(), 'yyyy-MM-dd');
   const snap = await getDoc(doc(db, 'users', uid, 'habits', habitId, 'logs', today));
   return snap.exists() && !!snap.data()?.completed;
@@ -395,11 +458,29 @@ export async function getHabitLogsForMonth(
   }));
 }
 
+// รวม log รายวันเป็นหน่วยตามความถี่ของนิสัยก่อนคำนวณ % สำเร็จ — ทุกวัน: % = วันที่ทำ/วันทั้งหมด
+// ทุกสัปดาห์: จัดกลุ่มเป็นสัปดาห์ก่อน (ถือว่าสัปดาห์นั้น "ทำ" ถ้ามีวันใดวันหนึ่ง completed) แล้ว % = สัปดาห์ที่ทำ/สัปดาห์ทั้งหมด
+// ใช้ร่วมกันใน getMonthlyRate ด้านล่าง และ runAiAnalysis กันคำนวณ % ไม่ตรงกัน 2 ที่
+function calcRate(logs: HabitLog[], frequency: HabitFrequency): number {
+  if (logs.length === 0) return 0;
+  if (frequency !== 'weekly') {
+    const done = logs.filter(l => l.completed).length;
+    return Math.round((done / logs.length) * 100);
+  }
+  const weeks = new Map<string, boolean>();
+  for (const log of logs) {
+    const [y, m, d] = log.id.split('-').map(Number);
+    const weekKey = format(startOfWeek(new Date(y, m - 1, d), { weekStartsOn: 1 }), 'yyyy-MM-dd');
+    weeks.set(weekKey, (weeks.get(weekKey) ?? false) || log.completed);
+  }
+  const vals = [...weeks.values()];
+  return vals.length > 0 ? Math.round((vals.filter(Boolean).length / vals.length) * 100) : 0;
+}
+
 // % ความสำเร็จของนิสัยหนึ่งตัวในเดือนปัจจุบัน — ใช้ภายใน services เองโดย generateReport (habitRates)
-export async function getMonthlyRate(uid: string, habitId: string): Promise<number> {
+export async function getMonthlyRate(uid: string, habitId: string, frequency: HabitFrequency = 'daily'): Promise<number> {
   const logs = await getHabitLogsMonth(uid, habitId);
-  const done = logs.filter(l => l.completed).length;
-  return logs.length > 0 ? Math.round((done / logs.length) * 100) : 0;
+  return calcRate(logs, frequency);
 }
 
 // ═══════════════════════════════════════════
@@ -479,15 +560,18 @@ export async function checkAndNotify(uid: string) {
     }
   }
 
-  // ตรวจนิสัย
+  // ตรวจนิสัย — ทุกวันเช็คแค่วันนี้ ทุกสัปดาห์เช็คทั้งสัปดาห์ (ไม่เตือนซ้ำถ้าทำไปแล้ววันก่อนในสัปดาห์นี้)
   const habitSnap = await getDocs(collection(db, 'users', uid, 'habits'));
   for (const d of habitSnap.docs) {
-    const logSnap = await getDoc(doc(db, 'users', uid, 'habits', d.id, 'logs', today));
-    if (logSnap.exists() && logSnap.data()?.completed) continue;
-    const streak = await computeStreak(uid, d.id);
+    const frequency = (d.data().frequency as HabitFrequency) ?? 'daily';
+    const done = await isHabitDoneToday(uid, d.id, frequency);
+    if (done) continue;
+    const streak = await computeStreak(uid, d.id, frequency);
+    const unit = frequency === 'weekly' ? 'สัปดาห์' : 'วัน';
+    const periodLabel = frequency === 'weekly' ? 'สัปดาห์นี้' : 'วันนี้';
     const msg = streak >= 5
-      ? `อย่าลืม "${d.data().name}" วันนี้ ต่อเนื่องมา ${streak} วันแล้ว!`
-      : `อย่าลืม "${d.data().name}" วันนี้`;
+      ? `อย่าลืม "${d.data().name}" ${periodLabel} ต่อเนื่องมา ${streak} ${unit}แล้ว!`
+      : `อย่าลืม "${d.data().name}" ${periodLabel}`;
     await createNotification(uid, 'นิสัยที่ยังไม่ได้ทำ', msg,
       streak >= 5 ? 'habit_streak' : 'habit_reminder',
       `users/${uid}/habits/${d.id}`,
@@ -649,8 +733,7 @@ export async function runAiAnalysis(
     // ช่วง "ทั้งหมด" ให้นับตั้งแต่วันที่สร้างนิสัยนี้ขึ้นมาจริงๆ (ไม่ใช่ epoch) ส่วน 7/30 วัน ให้ clamp ไม่ให้ย้อนก่อนวันที่สร้างนิสัย
     const effectiveFrom = period === 'all' ? h.createdAt : (from > h.createdAt ? from : h.createdAt);
     const logs = await getHabitLogsForPeriod(uid, h.id, effectiveFrom, now);
-    const doneCount = logs.filter(l => l.completed).length;
-    const rate = logs.length > 0 ? Math.round((doneCount / logs.length) * 100) : 0;
+    const rate = calcRate(logs, h.frequency);
     return {
       name: h.name,
       category: h.category,
@@ -768,18 +851,29 @@ export async function getLatestAnalysis(uid: string, period: AnalysisPeriod) {
 const MONTH_SHORT_TH = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
 
 // สร้างกราฟให้เหมาะกับช่วงที่เลือก: เดือนนี้ -> รายสัปดาห์ในเดือน, 3 เดือน -> รายเดือน x3, ทั้งหมด -> รายเดือนย้อนหลัง 12 เดือน
+// รับ: todos ทั้งหมดของ user + period ที่เลือก + now (เวลาปัจจุบัน) -> คืนค่า: { labels, values } สำหรับวาดกราฟแท่ง
+// ใช้ต่อใน: generateReport ด้านล่างเท่านั้น (ผลลัพธ์ถูกเก็บเป็น chartData.labels/values ส่งต่อให้หน้า report.jsx render)
 function buildChartBuckets(todos: Todo[], period: ReportPeriod, now: Date): { labels: string[]; values: number[] } {
   const doneTodos = todos.filter(t => t.status === 'done');
   const dateOf = (t: Todo) => t.updatedAt ?? t.createdAt;
 
   if (period === 'this_month') {
     const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-    const weekCount = Math.ceil(daysInMonth / 7);
-    const values = Array(weekCount).fill(0);
+    // แบ่งเป็นสัปดาห์ปฏิทินจริง (จันทร์เริ่ม) ไม่ใช่ทุก 7 วันนับจากวันที่ 1 — ให้ตรงกับนิยาม "สัปดาห์"
+    // ที่ใช้กับนิสัยแบบทุกสัปดาห์ (ดู weekDates/computeStreak ด้านบน) กันความหมาย "สัปดาห์" เพี้ยนกันคนละที่ในแอป
+    const weekStarts: string[] = [];
+    const weekIndexOfDay = new Map<number, number>(); // วันที่ (1..daysInMonth) -> ลำดับสัปดาห์ในเดือนนี้
+    for (let day = 1; day <= daysInMonth; day++) {
+      const wk = format(startOfWeek(new Date(now.getFullYear(), now.getMonth(), day), { weekStartsOn: 1 }), 'yyyy-MM-dd');
+      let idx = weekStarts.indexOf(wk);
+      if (idx === -1) { weekStarts.push(wk); idx = weekStarts.length - 1; }
+      weekIndexOfDay.set(day, idx);
+    }
+    const values = Array(weekStarts.length).fill(0);
     doneTodos.forEach(t => {
       const d = dateOf(t);
       if (d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth()) {
-        values[Math.min(weekCount - 1, Math.floor((d.getDate() - 1) / 7))]++;
+        values[weekIndexOfDay.get(d.getDate())!]++;
       }
     });
     return { labels: values.map((_, i) => `สัปดาห์ ${i + 1}`), values };
@@ -812,6 +906,8 @@ function buildCategoryBreakdown(todos: Todo[]): Record<TodoCategory, { total: nu
 }
 
 // ช่วงก่อนหน้าที่ยาวเท่ากัน สำหรับเทียบ % สำเร็จ — "ทั้งหมด" ไม่มีช่วงก่อนหน้าให้เทียบ
+// รับ: period ที่เลือก + now (เวลาปัจจุบัน) -> คืนค่า: { from, to } ของช่วงก่อนหน้า หรือ null ถ้า period = 'all'
+// ใช้ต่อใน: generateReport ด้านล่างเท่านั้น เพื่อกรอง allTodos หาค่า comparison (เทียบ success rate เก่า-ใหม่)
 function getPreviousRange(period: ReportPeriod, now: Date): { from: Date; to: Date } | null {
   if (period === 'this_month') {
     return { from: new Date(now.getFullYear(), now.getMonth() - 1, 1), to: new Date(now.getFullYear(), now.getMonth(), 1) };
@@ -840,7 +936,7 @@ export async function generateReport(uid: string, period: ReportPeriod): Promise
 
   const habits = await getHabits(uid);
   const habitRates: Record<string,number> = {};
-  for (const h of habits) habitRates[h.id] = await getMonthlyRate(uid, h.id);
+  for (const h of habits) habitRates[h.id] = await getMonthlyRate(uid, h.id, h.frequency);
 
   let comparison: ReportCache['comparison'] = null;
   const prevRange = getPreviousRange(period, now);

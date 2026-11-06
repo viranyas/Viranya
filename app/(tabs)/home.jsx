@@ -26,12 +26,17 @@ export default function HomeScreen() {
   // ทำไปแล้ววันนี้ (isHabitDoneToday) แล้วสั่ง checkAndNotify ให้สร้างแจ้งเตือนถ้ามีงานใกล้/เกินกำหนด
   const load = async () => {
     if (!user) return;
-    const [t, h] = await Promise.all([getTodos(user.uid), getHabits(user.uid)]);
-    setTodos(t); setHabits(h);
-    const m = {};
-    for (const habit of h) m[habit.id] = await isHabitDoneToday(user.uid, habit.id);
-    setDoneToday(m);
-    await checkAndNotify(user.uid);
+    try {
+      const [t, h] = await Promise.all([getTodos(user.uid), getHabits(user.uid)]);
+      setTodos(t); setHabits(h);
+      const m = {};
+      for (const habit of h) m[habit.id] = await isHabitDoneToday(user.uid, habit.id, habit.frequency);
+      setDoneToday(m);
+      await checkAndNotify(user.uid);
+    } catch (e) {
+      // เกิดได้เมื่อกด logout ระหว่าง load() ยังทำงานค้างอยู่ (checkAndNotify วน query หลายรอบติดกัน
+      // ถ้า sign out ไปก่อน query ที่ยิงต่อจะถูก Firestore ปฏิเสธด้วย permission error) — ไม่ใช่ error ที่ต้องแจ้งผู้ใช้
+    }
   };
 
   // โหลดใหม่ทุกครั้งที่ user เปลี่ยน (เช่น login/logout ที่มาจาก app/_layout.jsx)
@@ -39,10 +44,28 @@ export default function HomeScreen() {
   // ใช้กับ pull-to-refresh (RefreshControl ด้านล่าง)
   const onRefresh = async () => { setRefresh(true); await load(); setRefresh(false); };
 
-  const pendingTodos = todos.filter(t => t.status === "pending");
+  // งานวันนี้ = งานที่ยังไม่เสร็จ และกำหนดส่งอยู่ในวันนี้ (หรือเลยกำหนดมาแล้ว) — ไม่รวมงานที่ยังไม่ถึงกำหนด/ไม่มีกำหนด
+  const isDueTodayOrOverdue = (t) => {
+    if (!t.dueDatetime) return false;
+    const endOfToday = new Date();
+    endOfToday.setHours(23, 59, 59, 999);
+    return new Date(t.dueDatetime).getTime() <= endOfToday.getTime();
+  };
+  const todayTodos   = todos.filter(t => t.status === "pending" && isDueTodayOrOverdue(t));
+  // เรียงงานที่ยังไม่ได้ทำจากใกล้กำหนดมากที่สุดขึ้นก่อน งานที่ไม่มีกำหนดจะอยู่ท้ายสุด
+  const pendingTodos = todos
+    .filter(t => t.status === "pending")
+    .sort((a, b) => {
+      if (!a.dueDatetime && !b.dueDatetime) return 0;
+      if (!a.dueDatetime) return 1;
+      if (!b.dueDatetime) return -1;
+      return new Date(a.dueDatetime).getTime() - new Date(b.dueDatetime).getTime();
+    });
   const doneTodos    = todos.filter(t => t.status === "done");
   const habitsDone   = habits.filter(h => doneToday[h.id]).length;
   const successRate  = todos.length > 0 ? Math.round((doneTodos.length / todos.length) * 100) : 0;
+  const successRatehabits  = habits.length > 0 ? Math.round((habitsDone / habits.length) * 100) : 0;
+  
 
   return (
     <View style={styles.container}>
@@ -69,7 +92,7 @@ export default function HomeScreen() {
         <View style={styles.statsCard}>
           <View style={styles.statsRow}>
             <View style={styles.statItem}>
-              <Text style={styles.statVal}>{pendingTodos.length}</Text>
+              <Text style={styles.statVal}>{todayTodos.length}</Text>
               <Text style={styles.statLabel}>งานวันนี้</Text>
             </View>
             <View style={styles.statDivider} />
@@ -84,24 +107,31 @@ export default function HomeScreen() {
             </View>
           </View>
           <View style={styles.progressHeader}>
-            <Text style={styles.progressLabel}>ความก้าวหน้าสัปดาห์นี้</Text>
+            <Text style={styles.progressLabel}>ความก้าวหน้ารายงานทั้งหมด</Text>
             <Text style={styles.progressPct}>{successRate + "%"}</Text>
           </View>
           <View style={styles.progressBg}>
             <View style={[styles.progressFill, { width: successRate + "%" }]} />
           </View>
+          <View style={[styles.progressHeader, { marginTop:14 }]}>
+            <Text style={styles.progressLabel}>ความก้าวหน้านิสัยทั้งหมด</Text>
+            <Text style={styles.progressPctHabits}>{successRatehabits + "%"}</Text>
+          </View>
+          <View style={styles.progressBgHabits}>
+            <View style={[styles.progressFillhabits, { width: successRatehabits + "%" }]} />
+          </View>
         </View>
 
         <View style={styles.section}>
           <View style={styles.sectionHeader}>
-            <Text style={styles.sectionTitle}>งานเร่งด่วน</Text>
+            <Text style={styles.sectionTitle}>งานที่ยังไม่ได้ทำ</Text>
             <TouchableOpacity onPress={() => router.push("/(tabs)/todos")}>
               <Text style={styles.seeAll}>ดูทั้งหมด →</Text>
             </TouchableOpacity>
           </View>
           {pendingTodos.length === 0
             ? <Text style={styles.empty}>ไม่มีงานค้าง 🎉</Text>
-            : pendingTodos.slice(0, 3).map(t => (
+            : pendingTodos.slice(0, 4).map(t => (
               <View key={t.id} style={styles.todoRow}>
                 <View style={[styles.priDot, { backgroundColor:PRI_COLOR[t.priority] }]} />
                 <Text style={styles.todoTitle} numberOfLines={1}>{t.title}</Text>
@@ -122,7 +152,7 @@ export default function HomeScreen() {
           </View>
           {habits.length === 0
             ? <Text style={styles.empty}>ยังไม่มีนิสัย เพิ่มนิสัยแรกได้เลย!</Text>
-            : habits.slice(0, 3).map(h => {
+            : habits.slice(0, 4).map(h => {
               const done = !!doneToday[h.id];
               return (
                 <View key={h.id} style={styles.habitRow}>
@@ -160,8 +190,11 @@ const styles = StyleSheet.create({
   progressHeader: { flexDirection:"row", justifyContent:"space-between", marginBottom:6 },
   progressLabel:  { fontSize:11, color:C.textSub },
   progressPct:    { fontSize:11, fontWeight:"700", color:C.primary },
+  progressPctHabits: { fontSize:11, fontWeight:"700", color:C.green },
   progressBg:     { height:6, backgroundColor:C.lavLight, borderRadius:3, overflow:"hidden" },
+  progressBgHabits: { height:6, backgroundColor:'#D1FAE5', borderRadius:3, overflow:"hidden" },
   progressFill:   { height:"100%", backgroundColor:C.primary, borderRadius:3 },
+  progressFillhabits: { height:"100%", backgroundColor:C.green, borderRadius:3 },
   section:        { backgroundColor:C.bgCard, marginHorizontal:16, borderRadius:14, padding:14, marginBottom:12, borderWidth:0.5, borderColor:C.border },
   sectionHeader:  { flexDirection:"row", justifyContent:"space-between", alignItems:"center", marginBottom:12 },
   sectionTitle:   { fontSize:14, fontWeight:"700", color:C.text },

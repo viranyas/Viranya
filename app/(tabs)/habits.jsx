@@ -3,12 +3,28 @@ import { useEffect, useRef, useState } from "react";
 import { View, Text, ScrollView, TouchableOpacity, StyleSheet, Alert, RefreshControl, Modal, TextInput, StatusBar } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams } from "expo-router";
+import { startOfWeek, format } from "date-fns";
 import { useStore } from "../../src/hooks/useStore";
 import { getHabits, addHabit, deleteHabit, toggleHabitLog, getHabitLogsForMonth } from "../../src/services";
 import { C } from "../../src/config/theme";
 import { HABIT_CATEGORIES, CATEGORY_META } from "../../src/config/categories";
 
 const MONTHS_TH = ["มกราคม","กุมภาพันธ์","มีนาคม","เมษายน","พฤษภาคม","มิถุนายน","กรกฎาคม","สิงหาคม","กันยายน","ตุลาคม","พฤศจิกายน","ธันวาคม"];
+
+// จัดกลุ่ม log รายวันของเดือนหนึ่งให้เป็นสัปดาห์ (จันทร์-อาทิตย์) — ใช้กับนิสัยแบบ "ทุกสัปดาห์" เท่านั้น
+// ถือว่าสัปดาห์นั้น "ทำแล้ว" ถ้ามีวันใดวันหนึ่งในสัปดาห์ completed=true — ใช้ทั้งคำนวณ % สำเร็จและโชว์กริดรายสัปดาห์
+const groupLogsByWeek = (monthLogs, year, month) => {
+  const map = new Map();
+  monthLogs.forEach((log, i) => {
+    const day = i + 1;
+    const weekKey = format(startOfWeek(new Date(year, month, day), { weekStartsOn: 1 }), "yyyy-MM-dd");
+    if (!map.has(weekKey)) map.set(weekKey, { startDay: day, endDay: day, done: false });
+    const w = map.get(weekKey);
+    w.endDay = day;
+    w.done = w.done || log.completed;
+  });
+  return [...map.values()];
+};
 
 export default function HabitsScreen() {
   const { user } = useStore();
@@ -23,6 +39,8 @@ export default function HabitsScreen() {
   const [category,setCategory]= useState("self_development");
   const [saving,  setSaving]  = useState(false);
   const [highlightedId, setHighlightedId] = useState(null);
+  // แยกดูนิสัยทีละประเภทความถี่ (ทุกวัน/ทุกสัปดาห์) — ปุ่มสลับที่มุมขวาบน ไม่กระทบนิสัยอื่นที่ไม่ได้เลือกดู
+  const [freqView, setFreqView] = useState("daily");
   const scrollRef = useRef(null);
   const itemY = useRef({});
   const didHighlightRef = useRef(null);
@@ -46,17 +64,28 @@ export default function HabitsScreen() {
   // เพื่อคำนวณ % สำเร็จของแต่ละนิสัยในเดือนนั้น — เรียกใหม่ทุกครั้งที่เปลี่ยนเดือนหรือ user
   const load = async () => {
     if (!user) return;
-    const h = await getHabits(user.uid);
-    setHabits(h);
-    const lm = {};
-    const rm = {};
-    for (const habit of h) {
-      const monthLogs = await getHabitLogsForMonth(user.uid, habit.id, selMonth.year, selMonth.month);
-      lm[habit.id] = monthLogs;
-      const done = monthLogs.slice(0, countedDays).filter(l => l.completed).length;
-      rm[habit.id] = Math.round((done / countedDays) * 100);
+    try {
+      const h = await getHabits(user.uid);
+      setHabits(h);
+      const lm = {};
+      const rm = {};
+      for (const habit of h) {
+        const monthLogs = await getHabitLogsForMonth(user.uid, habit.id, selMonth.year, selMonth.month);
+        lm[habit.id] = monthLogs;
+        const counted = monthLogs.slice(0, countedDays);
+        if (habit.frequency === "weekly") {
+          const weeks = groupLogsByWeek(counted, selMonth.year, selMonth.month);
+          rm[habit.id] = weeks.length > 0 ? Math.round((weeks.filter(w => w.done).length / weeks.length) * 100) : 0;
+        } else {
+          const done = counted.filter(l => l.completed).length;
+          rm[habit.id] = Math.round((done / countedDays) * 100);
+        }
+      }
+      setLogs(lm); setRates(rm);
+    } catch (e) {
+      // เกิดได้เมื่อกด logout ระหว่าง load() ยังวน query ของแต่ละนิสัยค้างอยู่ — ไม่ใช่ error ที่ต้องแจ้งผู้ใช้
+      // (ดูคอมเมนต์เหตุผลเต็ม ๆ ที่ load() ใน app/(tabs)/home.jsx)
     }
-    setLogs(lm); setRates(rm);
   };
 
   useEffect(() => { load(); }, [user, selMonth]);
@@ -68,6 +97,9 @@ export default function HabitsScreen() {
   useEffect(() => {
     if (!highlightId || habits.length === 0 || didHighlightRef.current === highlightId) return;
     didHighlightRef.current = highlightId;
+    // สลับไปแท็บความถี่ที่ตรงกับนิสัยนี้ก่อน ไม่งั้นการ์ดจะถูกกรองออกไปแล้ว scroll ไม่เจอ
+    const target = habits.find(h => h.id === highlightId);
+    if (target) setFreqView(target.frequency);
     setHighlightedId(highlightId);
     const scrollTimer = setTimeout(() => {
       const y = itemY.current[highlightId];
@@ -77,11 +109,22 @@ export default function HabitsScreen() {
     return () => { clearTimeout(scrollTimer); clearTimeout(clearTimer); };
   }, [highlightId, habits]);
 
-  // ติ๊ก/ยกเลิกติ๊กว่าทำนิสัยนี้ "วันนี้" แล้วหรือยัง — เขียน log ผ่าน toggleHabitLog (src/services)
+  // เช็คว่านิสัย h "ทำแล้ว" ตามความถี่จริงของนิสัยหรือยัง โดยอิงจาก log ของเดือนที่กำลังดูอยู่
+  // ทุกวัน: ต้องมี log ของวันนี้ตรงๆ / ทุกสัปดาห์: มีวันไหนในสัปดาห์นี้ทำแล้วก็พอ (ใช้ได้เฉพาะตอนดูเดือนปัจจุบัน เหมือน daily เดิม)
+  const isDoneNow = (h) => {
+    if (h.frequency === "weekly") {
+      if (!isCurrentMonth) return false;
+      const weeks = groupLogsByWeek(logs[h.id] ?? [], selMonth.year, selMonth.month);
+      const thisWeek = weeks.find(w => now.getDate() >= w.startDay && now.getDate() <= w.endDay);
+      return !!thisWeek?.done;
+    }
+    return !!logs[h.id]?.some(l => l.id===today && l.completed);
+  };
+
+  // ติ๊ก/ยกเลิกติ๊กว่าทำนิสัยนี้แล้วหรือยัง — เขียน log ผ่าน toggleHabitLog (src/services)
   const handleToggle = async (h) => {
     if (!user) return;
-    const done = logs[h.id]?.some(l => l.id===today && l.completed);
-    await toggleHabitLog(user.uid, h.id, !done);
+    await toggleHabitLog(user.uid, h.id, !isDoneNow(h), h.frequency);
     await load();
   };
 
@@ -113,6 +156,19 @@ export default function HabitsScreen() {
       <StatusBar barStyle="dark-content" backgroundColor={C.bgHeader} />
       <View style={styles.header}>
         <Text style={styles.title}>นิสัยของฉัน</Text>
+        <View style={styles.segmentWrap}>
+          {["daily","weekly"].map(f => (
+            <TouchableOpacity
+              key={f}
+              style={[styles.segmentBtn, freqView===f && styles.segmentBtnOn]}
+              onPress={() => setFreqView(f)}
+            >
+              <Text style={[styles.segmentText, freqView===f && styles.segmentTextOn]}>
+                {f==="daily" ? "ทุกวัน" : "ทุกสัปดาห์"}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
       </View>
       <ScrollView
         ref={scrollRef}
@@ -124,14 +180,16 @@ export default function HabitsScreen() {
           <Text style={styles.monthBtnText}>{monthLabel(selMonth)}</Text>
           <Ionicons name="chevron-down" size={16} color={C.primary2} />
         </TouchableOpacity>
-        {habits.length===0 && (
+        {habits.filter(h => h.frequency === freqView).length===0 && (
           <View style={styles.emptyBox}>
             <Text style={styles.emptyIcon}>🌱</Text>
-            <Text style={styles.emptyText}>{"ยังไม่มีนิสัย\nเริ่มสร้างนิสัยแรกของคุณ!"}</Text>
+            <Text style={styles.emptyText}>
+              {freqView==="daily" ? "ยังไม่มีนิสัยแบบทุกวัน\nเริ่มสร้างนิสัยแรกของคุณ!" : "ยังไม่มีนิสัยแบบทุกสัปดาห์\nเริ่มสร้างนิสัยแรกของคุณ!"}
+            </Text>
           </View>
         )}
-        {habits.map(h => {
-          const done = logs[h.id]?.some(l => l.id===today && l.completed);
+        {habits.filter(h => h.frequency === freqView).map(h => {
+          const done = isDoneNow(h);
           const r    = rates[h.id] ?? 0;
           const rc   = rateColor(r);
           return (
@@ -148,25 +206,43 @@ export default function HabitsScreen() {
                       <Ionicons name={CATEGORY_META[h.category].icon} size={10} color={CATEGORY_META[h.category].color} />
                       <Text style={[styles.categoryBadgeText, {color: CATEGORY_META[h.category].color}]}>{CATEGORY_META[h.category].label}</Text>
                     </View>
-                    <Text style={styles.habitStreak}>{"🔥 ต่อเนื่อง " + h.streakCount + " วัน"}</Text>
+                    <Text style={styles.habitStreak}>{"🔥 ต่อเนื่อง " + h.streakCount + (h.frequency==="weekly" ? " สัปดาห์" : " วัน")}</Text>
                   </View>
                 </View>
                 <TouchableOpacity style={[styles.toggleBtn, done&&styles.toggleBtnDone]} onPress={() => handleToggle(h)}>
-                  <Text style={[styles.toggleBtnText, done&&styles.toggleBtnTextDone]}>{done?"✓ ทำแล้ว":"ทำวันนี้"}</Text>
+                  <Text style={[styles.toggleBtnText, done&&styles.toggleBtnTextDone]}>
+                    {done ? "✓ ทำแล้ว" : (h.frequency==="weekly" ? "ทำสัปดาห์นี้" : "ทำวันนี้")}
+                  </Text>
                 </TouchableOpacity>
               </View>
               <View style={styles.dotRow}>
-                {(logs[h.id]??Array(new Date(selMonth.year, selMonth.month+1, 0).getDate()).fill({completed:false})).map((log,i) => {
-                  const isFuture = isCurrentMonth && i+1 > now.getDate();
-                  const isToday  = isCurrentMonth && i+1 === now.getDate();
-                  return (
-                    <View key={i} style={styles.dotWrap}>
-                      <View style={[styles.dot, isFuture&&{opacity:0.45}, isToday&&styles.dotToday, log.completed && styles.dotDone]}>
-                        <Text style={[styles.dotLabel, log.completed && styles.dotLabelDone]}>{i+1}</Text>
-                      </View>
-                    </View>
-                  );
-                })}
+                {h.frequency === "weekly"
+                  ? groupLogsByWeek(
+                      logs[h.id] ?? Array(new Date(selMonth.year, selMonth.month+1, 0).getDate()).fill({completed:false}),
+                      selMonth.year, selMonth.month,
+                    ).map((wk,i) => {
+                      const isFuture = isCurrentMonth && wk.startDay > now.getDate();
+                      const isThisWeek = isCurrentMonth && now.getDate() >= wk.startDay && now.getDate() <= wk.endDay;
+                      return (
+                        <View key={i} style={styles.dotWrap}>
+                          <View style={[styles.dot, styles.weekDot, isFuture&&{opacity:0.45}, isThisWeek&&styles.dotToday, wk.done && styles.dotDone]}>
+                            <Text style={[styles.dotLabel, wk.done && styles.dotLabelDone]}>{"W" + (i+1)}</Text>
+                          </View>
+                        </View>
+                      );
+                    })
+                  : (logs[h.id]??Array(new Date(selMonth.year, selMonth.month+1, 0).getDate()).fill({completed:false})).map((log,i) => {
+                      const isFuture = isCurrentMonth && i+1 > now.getDate();
+                      const isToday  = isCurrentMonth && i+1 === now.getDate();
+                      return (
+                        <View key={i} style={styles.dotWrap}>
+                          <View style={[styles.dot, isFuture&&{opacity:0.45}, isToday&&styles.dotToday, log.completed && styles.dotDone]}>
+                            <Text style={[styles.dotLabel, log.completed && styles.dotLabelDone]}>{i+1}</Text>
+                          </View>
+                        </View>
+                      );
+                    })
+                }
               </View>
               <View style={styles.progressRow}>
                 <View style={styles.progressBg}>
@@ -256,6 +332,11 @@ const styles = StyleSheet.create({
   container:       { flex:1, backgroundColor:C.bg },
   header:          { flexDirection:"row", justifyContent:"space-between", alignItems:"center", backgroundColor:C.bgHeader, paddingHorizontal:20, paddingTop:52, paddingBottom:14 },
   title:           { fontSize:22, fontWeight:"700", color:C.text },
+  segmentWrap:     { flexDirection:"row", backgroundColor:C.bg, borderRadius:20, padding:2, borderWidth:0.5, borderColor:C.border },
+  segmentBtn:      { paddingHorizontal:12, paddingVertical:6, borderRadius:18 },
+  segmentBtnOn:    { backgroundColor:C.primary },
+  segmentText:     { fontSize:12, color:C.textSub, fontWeight:"600" },
+  segmentTextOn:   { color:C.white, fontWeight:"700" },
   fab:             {
     position:"absolute", bottom:24, right:20,
     width:56, height:56, borderRadius:28,
@@ -281,6 +362,7 @@ const styles = StyleSheet.create({
   dotRow:          { flexDirection:"row", flexWrap:"wrap", gap:5, marginBottom:10 },
   dotWrap:         { alignItems:"center" },
   dot:             { width:24, height:24, borderRadius:7, backgroundColor:C.bg, borderWidth:0.5, borderColor:C.border, justifyContent:"center", alignItems:"center" },
+  weekDot:         { width:34 },
   dotToday:        { borderWidth:1.5, borderColor:C.primary },
   dotDone:         { backgroundColor:C.primary, borderColor:C.primary },
   dotLabel:        { fontSize:10, color:C.textSub },

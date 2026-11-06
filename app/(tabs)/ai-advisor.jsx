@@ -33,12 +33,17 @@ export default function AiAdvisorScreen() {
   useEffect(() => {
     if (!user) return;
     (async () => {
-      const r = await getLatestAnalysis(user.uid, period);
-      // ตรวจสอบว่ามีข้อมูลหรือไม่ ถ้าไม่มีให้ล้างค่าเก่าออกเพื่อให้แสดงหน้า Empty State
-      if (r) {
-        setAiResult(r.analysis, r.insights);
-      } else {
-        setAiResult(null, []);
+      try {
+        const r = await getLatestAnalysis(user.uid, period);
+        // ตรวจสอบว่ามีข้อมูลหรือไม่ ถ้าไม่มีให้ล้างค่าเก่าออกเพื่อให้แสดงหน้า Empty State
+        if (r) {
+          setAiResult(r.analysis, r.insights);
+        } else {
+          setAiResult(null, []);
+        }
+      } catch (e) {
+        // เกิดได้เมื่อกด logout ระหว่าง query นี้ยังค้างอยู่ — ไม่ใช่ error ที่ต้องแจ้งผู้ใช้
+        // (ดูคอมเมนต์เหตุผลเต็ม ๆ ที่ load() ใน app/(tabs)/home.jsx)
       }
     })();
   }, [user, period]);

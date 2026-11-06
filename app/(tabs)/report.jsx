@@ -18,6 +18,7 @@ export default function ReportScreen() {
   const [period, setPeriod] = useState("this_month");
   const [loading, setLoading] = useState(false);
   const [hNames, setHNames] = useState({});
+  const [hFreq, setHFreq] = useState({});
   const [hasUnread, setHasUnread] = useState(false);
 
   // เช็คว่ามีแจ้งเตือนที่ยังไม่อ่านไหม ทุกครั้งที่กลับมาหน้านี้ เพื่ออัปเดตจุดแดง
@@ -42,9 +43,9 @@ export default function ReportScreen() {
     setLoading(true);
     try {
       const habits = await getHabits(user.uid);
-      const nm = {};
-      habits.forEach(h => { nm[h.id] = h.name; });
-      setHNames(nm);
+      const nm = {}; const fm = {};
+      habits.forEach(h => { nm[h.id] = h.name; fm[h.id] = h.frequency; });
+      setHNames(nm); setHFreq(fm);
       const r = await generateReport(user.uid, period);
       setReport(period, r);
     } finally { setLoading(false); }
@@ -145,10 +146,25 @@ export default function ReportScreen() {
               </View>
             )}
 
-            {Object.keys(cache.chartData.habitRates).length > 0 && (
+            {Object.entries(cache.chartData.habitRates).filter(([hid]) => hFreq[hid] !== "weekly").length > 0 && (
               <View style={styles.habitCard}>
-                <Text style={styles.chartTitle}>ความต่อเนื่องนิสัย</Text>
-                {Object.entries(cache.chartData.habitRates).map(([hid,rate]) => (
+                <Text style={styles.chartTitle}>ความต่อเนื่องนิสัยทุกวัน</Text>
+                {Object.entries(cache.chartData.habitRates).filter(([hid]) => hFreq[hid] !== "weekly").map(([hid,rate]) => (
+                  <View key={hid} style={styles.habitRateRow}>
+                    <Text style={styles.habitRateName} numberOfLines={1}>{hNames[hid]??hid}</Text>
+                    <View style={styles.progressBg}>
+                      <View style={[styles.progressFill, {width:rate+"%", backgroundColor:rColor(rate)}]} />
+                    </View>
+                    <Text style={[styles.rateText,{color:rColor(rate)}]}>{rate+"%"}</Text>
+                  </View>
+                ))}
+              </View>
+            )}
+
+            {Object.entries(cache.chartData.habitRates).filter(([hid]) => hFreq[hid] === "weekly").length > 0 && (
+              <View style={styles.habitCard}>
+                <Text style={styles.chartTitle}>ความต่อเนื่องนิสัยทุกสัปดาห์</Text>
+                {Object.entries(cache.chartData.habitRates).filter(([hid]) => hFreq[hid] === "weekly").map(([hid,rate]) => (
                   <View key={hid} style={styles.habitRateRow}>
                     <Text style={styles.habitRateName} numberOfLines={1}>{hNames[hid]??hid}</Text>
                     <View style={styles.progressBg}>

@@ -2,7 +2,7 @@
 import { useEffect } from 'react';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import { onAuthChanged, getUserProfile } from '../src/services';
+import { onAuthChanged, getUserProfile, isRegistrationInProgress } from '../src/services';
 import { useStore } from '../src/hooks/useStore';
 
 export default function RootLayout() {
@@ -14,12 +14,16 @@ export default function RootLayout() {
   useEffect(() => {
     return onAuthChanged(async (fu) => {
       if (fu) {
+        // กำลังอยู่ในขั้นตอนสมัครสมาชิก (register() auto sign-in ชั่วครู่ก่อน logout() ตามมาทันที) —
+        // ข้ามการอ่านโปรไฟล์ไปเลย ไม่งั้น query นี้จะไปชน race กับ logout() กลายเป็น Firestore
+        // permission error (ดู setRegistrationInProgress ใน src/services/index.ts สำหรับเหตุผลเต็ม ๆ)
+        if (isRegistrationInProgress()) { setLoading(false); return; }
         try {
           const p = await getUserProfile(fu.uid);
           setUser(p);
         } catch (e) {
-          // เกิดได้เมื่อ sign out ไปแล้วระหว่าง query นี้ยังค้างอยู่ (เช่น สมัครสมาชิกแล้ว logout ทันที)
-          // ทำให้ Firestore ปฏิเสธ request ด้วย permission error — ไม่ใช่ error ที่ต้องแจ้งผู้ใช้
+          // เผื่อไว้เป็นชั้นกันสำรอง (เช่น sign out ไปแล้วระหว่าง query อื่นค้างอยู่ด้วยเหตุอื่น)
+          // ไม่ใช่ error ที่ต้องแจ้งผู้ใช้
           setUser(null);
         }
       } else {
