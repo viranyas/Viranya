@@ -1,4 +1,7 @@
 # PlanWise App — React Native (Expo) + Firebase + Gemini AI
+## ลิ้งก์แนะนำแอป
+https://drive.google.com/file/d/1HYBcTd3tBGgGRDavIn1MomWwCK9zEImg/view?usp=drive_link
+
 
 ## โครงสร้างไฟล์
 
